@@ -163,7 +163,7 @@ public:
   AsyncResponseStream(const char *contentType, size_t bufferSize);
   AsyncResponseStream(const String &contentType, size_t bufferSize) : AsyncResponseStream(contentType.c_str(), bufferSize) {}
   bool _sourceValid() const override final {
-    return (_state < RESPONSE_END);
+    return _content && (_state < RESPONSE_END);
   }
   size_t _fillBuffer(uint8_t *buf, size_t maxLen) override final;
   size_t write(const uint8_t *data, size_t len);
@@ -172,7 +172,7 @@ public:
    * @brief Returns the number of bytes available in the stream.
    */
   size_t available() const {
-    return _content->available();
+    return _content ? _content->available() : 0;
   }
   using Print::write;
 };
