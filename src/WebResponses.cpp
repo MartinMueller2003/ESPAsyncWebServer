@@ -73,6 +73,9 @@ AsyncWebServerResponse::AsyncWebServerResponse()
   : _code(0), _contentType(), _contentLength(0), _sendContentLength(true), _chunked(false), _headLength(0), _sentLength(0), _ackedLength(0), _writtenLength(0),
     _state(RESPONSE_SETUP) {
   for (const auto &header : DefaultHeaders::Instance()) {
+    if (!asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebHeader>())) {
+      break;  // no room for another header node: the response goes out without the remaining default headers
+    }
     _headers.emplace_back(header);
   }
 }
@@ -154,6 +157,9 @@ bool AsyncWebServerResponse::addHeader(AsyncWebHeader &&header, bool replaceExis
     }
   }
   // header was not found found, or existing one was removed
+  if (!asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebHeader>())) {
+    return false;  // no room for the header node
+  }
   _headers.emplace_back(std::move(header));
   return true;
 }
@@ -175,6 +181,9 @@ bool AsyncWebServerResponse::addHeader(const char *name, const char *value, bool
     }
   }
   // header was not found found, or existing one was removed
+  if (!asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebHeader>())) {
+    return false;  // no room for the header node
+  }
   _headers.emplace_back(name, value);
   return true;
 }
@@ -707,6 +716,12 @@ void AsyncFileResponse::_setContentTypeFromPath(const String &path) {
  */
 AsyncFileResponse::AsyncFileResponse(FS &fs, const String &path, const char *contentType, bool download, AwsTemplateProcessor callback)
   : AsyncAbstractResponse(callback) {
+  // Opening a file allocates the file object and its cache with a plain new. Without room for that the
+  // file stays closed and _sourceValid() reports the response as unusable.
+  if (!asyncsrv::canAllocateBlock(asyncsrv::FILE_OPEN_RESERVE)) {
+    _code = 500;
+    return;
+  }
   // Try to open the uncompressed version first
   _content = fs.open(path, fs::FileOpenMode::read);
   if (_content.available()) {
@@ -895,30 +910,37 @@ size_t AsyncProgmemResponse::_fillBuffer(uint8_t *data, size_t len) {
  * Response Stream (You can print/write/printf to it, up to the contentLen bytes)
  * */
 
+// cbuf allocates its storage with a plain new, which is fatal on the ESP8266 when it fails,
+// so the stream only asks for a buffer when a block of that size is free.
 AsyncResponseStream::AsyncResponseStream(const char *contentType, size_t bufferSize) {
   _code = 200;
   _contentLength = 0;
   _contentType = contentType;
-  // internal buffer will be null on allocation failure
-  _content = std::unique_ptr<cbuf>(new cbuf(bufferSize));
-  if (bufferSize && _content->size() < bufferSize) {
-#ifdef ESP32
-    log_e("Failed to allocate");
-#endif
+  // the buffer stays null when memory is short; _sourceValid() then reports the response as unusable
+  if (asyncsrv::canAllocateBlock(bufferSize)) {
+    _content = std::unique_ptr<cbuf>(new cbuf(bufferSize));
   }
+#ifdef ESP32
+  if (!_content) {
+    log_e("Failed to allocate");
+  }
+#endif
 }
 
 size_t AsyncResponseStream::_fillBuffer(uint8_t *buf, size_t maxLen) {
-  return _content->read((char *)buf, maxLen);
+  return _content ? _content->read((char *)buf, maxLen) : 0;
 }
 
 size_t AsyncResponseStream::write(const uint8_t *data, size_t len) {
-  if (_started()) {
+  if (_started() || !_content) {
     return 0;
   }
   if (len > _content->room()) {
     size_t needed = len - _content->room();
-    _content->resizeAdd(needed);
+    // the resize copies into a new block of the full size, so check for that much
+    if (asyncsrv::canAllocateBlock(_content->size() + needed)) {
+      _content->resizeAdd(needed);
+    }
     // log a warning if allocation failed, but do not return: keep writing the bytes we can
     // with _content->write: if len is more than the available size in the buffer, only
     // the available size will be written

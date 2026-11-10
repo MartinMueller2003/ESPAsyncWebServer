@@ -29,6 +29,39 @@
 
 #include "literals.h"
 
+// On the ESP8266 the core is built without exceptions, so a plain new that fails ends in a fatal reset instead
+// of returning null. The request path asks this before it allocates something that goes through a plain new
+// (container nodes, file objects, cbuf) and fails the request, the header or the response softly instead.
+// FS::open() allocates inside the core, out of this library's sight. On the ESP8266 with LittleFS that is the
+// lfs_file_t behind a shared_ptr (about 100 bytes with its control block), the file object (about 60), a copy
+// of the name, and the 64-byte read cache that littlefs allocates itself. The check looks at the largest free
+// block, so the reserve has to cover the largest of those; 256 leaves room for other filesystems.
+#ifndef ASYNCWEBSERVER_FILE_OPEN_RESERVE
+#define ASYNCWEBSERVER_FILE_OPEN_RESERVE 256
+#endif
+
+namespace asyncsrv {
+static constexpr size_t FILE_OPEN_RESERVE = ASYNCWEBSERVER_FILE_OPEN_RESERVE;
+// Room left over the requested size: the allocator's block header and a little headroom for whatever the
+// SDK allocates in the same moment.
+static constexpr size_t ALLOC_SLACK = 64;
+// A std::list node is the element plus its two links. That is how libstdc++ lays it out; a library that pads
+// the node differently is covered by ALLOC_SLACK.
+template <typename T> constexpr size_t listNodeSize() {
+  return sizeof(T) + 2 * sizeof(void *);
+}
+inline bool canAllocateBlock(size_t bytes) {
+#if defined(ESP8266)
+  return (bytes + ALLOC_SLACK) <= ESP.getMaxFreeBlockSize();
+#elif defined(ESP32)
+  return (bytes + ALLOC_SLACK) <= ESP.getMaxAllocHeap();
+#else
+  (void)bytes;
+  return true;
+#endif
+}
+}  // namespace asyncsrv
+
 #include "AsyncWebServerVersion.h"
 #define ASYNCWEBSERVER_FORK_ESP32Async
 
@@ -214,6 +247,7 @@ private:
 
   bool _sent = false;                            // response is sent
   bool _paused = false;                          // request is paused (request continuation)
+  bool _oom = false;                             // a header or parameter could not be stored; the request is failed
   std::shared_ptr<AsyncWebServerRequest> _this;  // shared pointer to this request
 
   String _temp;

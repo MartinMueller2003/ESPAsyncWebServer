@@ -137,6 +137,12 @@ bool AsyncStaticWebHandler::_getFile(AsyncWebServerRequest *request) const {
 #endif
 
 bool AsyncStaticWebHandler::_searchFile(AsyncWebServerRequest *request, const String &path) {
+  // Opening a file allocates the file object and its cache with a plain new. Without room for that the
+  // file counts as missing and the request falls through to the not-found handler.
+  if (!asyncsrv::canAllocateBlock(asyncsrv::FILE_OPEN_RESERVE)) {
+    return false;
+  }
+
   bool fileFound = false;
   bool gzipFound = false;
 
@@ -236,16 +242,17 @@ void AsyncStaticWebHandler::handleRequest(AsyncWebServerRequest *request) {
 
   if (not_modified) {
     request->_tempFile.close();
-    response = new AsyncBasicResponse(304);  // Not modified
+    response = new (std::nothrow) AsyncBasicResponse(304);  // Not modified
   } else {
-    response = new AsyncFileResponse(request->_tempFile, filename, emptyString, false, _callback);
+    response = new (std::nothrow) AsyncFileResponse(request->_tempFile, filename, emptyString, false, _callback);
   }
 
   if (!response) {
 #ifdef ESP32
     log_e("Failed to allocate");
 #endif
-    request->abort();
+    // Leave the request without a response: _send() answers or closes it after we return.
+    // Aborting the client here would delete the request while the server is still using it.
     return;
   }
 

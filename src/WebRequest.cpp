@@ -208,6 +208,12 @@ void AsyncWebServerRequest::_onData(void *buf, size_t len) {
         }
       }
       if (_parsedLength == _contentLength) {
+        if (_oom) {
+          // a body parameter could not be stored, see _parseLine()
+          _parseState = PARSE_REQ_FAIL;
+          _client->close(false);
+          return;
+        }
         _parseState = PARSE_REQ_END;
         _runMiddlewareChain();
         _send();
@@ -270,6 +276,10 @@ void AsyncWebServerRequest::_onDisconnect() {
 }
 
 void AsyncWebServerRequest::_addPathParam(const char *p) {
+  if (!asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<String>())) {
+    _oom = true;
+    return;
+  }
   _pathParams.emplace_back(p);
 }
 
@@ -287,6 +297,10 @@ void AsyncWebServerRequest::_addGetParams(const String &params) {
     String name = urlDecode(params.substring(start, equal));
     String value = urlDecode(equal + 1 < end ? params.substring(equal + 1, end) : emptyString);
     if (name.length()) {
+      if (!asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebParameter>())) {
+        _oom = true;
+        return;
+      }
       _params.emplace_back(name, value);
     }
     start = end + 1;
@@ -392,7 +406,11 @@ bool AsyncWebServerRequest::_parseReqHeader() {
         _reqconntype = RCT_EVENT;
       }
     }
-    _headers.emplace_back(std::move(header));
+    if (asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebHeader>())) {
+      _headers.emplace_back(std::move(header));
+    } else {
+      _oom = true;
+    }
   }
 #if defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350) || defined(LIBRETINY)
   // Ancient PRI core does not have String::clear() method 8-()
@@ -416,7 +434,11 @@ void AsyncWebServerRequest::_parsePlainPostChar(uint8_t data) {
     }
     name = urlDecode(name);
     if (name.length()) {
-      _params.emplace_back(name, urlDecode(value), true);
+      if (asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebParameter>())) {
+        _params.emplace_back(name, urlDecode(value), true);
+      } else {
+        _oom = true;
+      }
     }
 
 #if defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350) || defined(LIBRETINY)
@@ -594,14 +616,22 @@ void AsyncWebServerRequest::_parseMultipartPostByte(uint8_t data, bool last) {
     } else if (_boundaryPosition == _boundary.length() - 1) {
       _multiParseState = DASH3_OR_RETURN2;
       if (!_itemIsFile) {
-        _params.emplace_back(_itemName, _itemValue, true);
+        if (asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebParameter>())) {
+          _params.emplace_back(_itemName, _itemValue, true);
+        } else {
+          _oom = true;
+        }
       } else {
         if (_itemSize) {
           if (_handler) {
             _handler->handleUpload(this, _itemFilename, _itemSize - _itemBufferIndex, _itemBuffer, _itemBufferIndex, true);
           }
           _itemBufferIndex = 0;
-          _params.emplace_back(_itemName, _itemFilename, true, true, _itemSize);
+          if (asyncsrv::canAllocateBlock(asyncsrv::listNodeSize<AsyncWebParameter>())) {
+            _params.emplace_back(_itemName, _itemFilename, true, true, _itemSize);
+          } else {
+            _oom = true;
+          }
         }
         free(_itemBuffer);
         _itemBuffer = NULL;
@@ -668,10 +698,23 @@ void AsyncWebServerRequest::_parseLine() {
   }
 
   if (_parseState == PARSE_REQ_HEADERS) {
+    if (_oom) {
+      // a header or a parameter could not be stored: fail the request instead of handling it with part of
+      // them. The connection is closed on the next poll, not here, because the caller still uses this request.
+      _parseState = PARSE_REQ_FAIL;
+      _client->close(false);
+      return;
+    }
     if (!_temp.length()) {
       // end of headers
       _server->_rewriteRequest(this);
       _server->_attachHandler(this);
+      if (_oom) {
+        // a path parameter could not be stored
+        _parseState = PARSE_REQ_FAIL;
+        _client->close(false);
+        return;
+      }
       if (_expectingContinue) {
         String response(T_HTTP_100_CONT);
         _client->write(response.c_str(), response.length());
@@ -715,11 +758,19 @@ void AsyncWebServerRequest::_send() {
     }
 
     // response is not valid ?
-    if (!_response->_sourceValid()) {
+    if (_response && !_response->_sourceValid()) {
       send(500, T_text_plain, "Invalid data in handler");
     }
 
-    // here, we either have a response give nfrom user or one of the two above
+    // still nothing: the response could not be allocated. Nothing can be sent, so let the
+    // connection close on the next poll. Not here: closing the client now would delete this
+    // request while the code that called us is still using it.
+    if (!_response) {
+      _sent = true;
+      _client->close(false);
+      return;
+    }
+
     _client->setRxTimeout(0);
     _response->_respond(this);
     _sent = true;
@@ -871,20 +922,20 @@ double AsyncWebServerRequest::getAttribute(const char *name, double defaultValue
 
 AsyncWebServerResponse *AsyncWebServerRequest::beginResponse(int code, const char *contentType, const char *content, AwsTemplateProcessor callback) {
   if (callback) {
-    return new AsyncProgmemResponse(code, contentType, (const uint8_t *)content, strlen(content), callback);
+    return new (std::nothrow) AsyncProgmemResponse(code, contentType, (const uint8_t *)content, strlen(content), callback);
   }
-  return new AsyncBasicResponse(code, contentType, content);
+  return new (std::nothrow) AsyncBasicResponse(code, contentType, content);
 }
 
 AsyncWebServerResponse *
   AsyncWebServerRequest::beginResponse(int code, const char *contentType, const uint8_t *content, size_t len, AwsTemplateProcessor callback) {
-  return new AsyncProgmemResponse(code, contentType, content, len, callback);
+  return new (std::nothrow) AsyncProgmemResponse(code, contentType, content, len, callback);
 }
 
 AsyncWebServerResponse *
   AsyncWebServerRequest::beginResponse(FS &fs, const String &path, const char *contentType, bool download, AwsTemplateProcessor callback) {
   if (fs.exists(path) || (!download && fs.exists(path + T__gz))) {
-    return new AsyncFileResponse(fs, path, contentType, download, callback);
+    return new (std::nothrow) AsyncFileResponse(fs, path, contentType, download, callback);
   }
   return NULL;
 }
@@ -892,34 +943,34 @@ AsyncWebServerResponse *
 AsyncWebServerResponse *
   AsyncWebServerRequest::beginResponse(File content, const String &path, const char *contentType, bool download, AwsTemplateProcessor callback) {
   if (content == true) {
-    return new AsyncFileResponse(content, path, contentType, download, callback);
+    return new (std::nothrow) AsyncFileResponse(content, path, contentType, download, callback);
   }
   return NULL;
 }
 
 AsyncWebServerResponse *AsyncWebServerRequest::beginResponse(Stream &stream, const char *contentType, size_t len, AwsTemplateProcessor callback) {
-  return new AsyncStreamResponse(stream, contentType, len, callback);
+  return new (std::nothrow) AsyncStreamResponse(stream, contentType, len, callback);
 }
 
 AsyncWebServerResponse *
   AsyncWebServerRequest::beginResponse(const char *contentType, size_t len, AwsResponseFiller callback, AwsTemplateProcessor templateCallback) {
-  return new AsyncCallbackResponse(contentType, len, callback, templateCallback);
+  return new (std::nothrow) AsyncCallbackResponse(contentType, len, callback, templateCallback);
 }
 
 AsyncWebServerResponse *
   AsyncWebServerRequest::beginChunkedResponse(const char *contentType, AwsResponseFiller callback, AwsTemplateProcessor templateCallback) {
   if (_version) {
-    return new AsyncChunkedResponse(contentType, callback, templateCallback);
+    return new (std::nothrow) AsyncChunkedResponse(contentType, callback, templateCallback);
   }
-  return new AsyncCallbackResponse(contentType, 0, callback, templateCallback);
+  return new (std::nothrow) AsyncCallbackResponse(contentType, 0, callback, templateCallback);
 }
 
 AsyncResponseStream *AsyncWebServerRequest::beginResponseStream(const char *contentType, size_t bufferSize) {
-  return new AsyncResponseStream(contentType, bufferSize);
+  return new (std::nothrow) AsyncResponseStream(contentType, bufferSize);
 }
 
 AsyncWebServerResponse *AsyncWebServerRequest::beginResponse_P(int code, const String &contentType, PGM_P content, AwsTemplateProcessor callback) {
-  return new AsyncProgmemResponse(code, contentType, (const uint8_t *)content, strlen_P(content), callback);
+  return new (std::nothrow) AsyncProgmemResponse(code, contentType, (const uint8_t *)content, strlen_P(content), callback);
 }
 
 void AsyncWebServerRequest::send(AsyncWebServerResponse *response) {
@@ -943,7 +994,9 @@ void AsyncWebServerRequest::send(AsyncWebServerResponse *response) {
 
 void AsyncWebServerRequest::redirect(const char *url, int code) {
   AsyncWebServerResponse *response = beginResponse(code);
-  response->addHeader(T_LOCATION, url);
+  if (response) {
+    response->addHeader(T_LOCATION, url);
+  }
   send(response);
 }
 
