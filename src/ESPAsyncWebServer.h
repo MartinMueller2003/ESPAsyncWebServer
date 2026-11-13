@@ -50,11 +50,24 @@ static constexpr size_t ALLOC_SLACK = 64;
 template <typename T> constexpr size_t listNodeSize() {
   return sizeof(T) + 2 * sizeof(void *);
 }
+// Only the ESP8266 asks: there a failed new is fatal and getMaxFreeBlockSize() is a cheap read. The ESP32's
+// equivalent walks every block of every internal heap under the heap lock on each call, and a failed new
+// is not what takes an ESP32 down, so the check is skipped there.
+// The heap the request and transfer floors compare against. ESP.getFreeHeap() on the ESP32 counts the
+// IRAM-only heap as well, which neither malloc nor the network stack can use for buffers, so the floors
+// would see tens of KB that are not there; ask for byte-addressable internal memory instead.
+inline size_t freeHeapForBuffers() {
+#if defined(ESP32)
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#elif defined(ESP8266)
+  return ESP.getFreeHeap();
+#else
+  return SIZE_MAX;
+#endif
+}
 inline bool canAllocateBlock(size_t bytes) {
 #if defined(ESP8266)
   return (bytes + ALLOC_SLACK) <= ESP.getMaxFreeBlockSize();
-#elif defined(ESP32)
-  return (bytes + ALLOC_SLACK) <= ESP.getMaxAllocHeap();
 #else
   (void)bytes;
   return true;
@@ -248,6 +261,7 @@ private:
   bool _sent = false;                            // response is sent
   bool _paused = false;                          // request is paused (request continuation)
   bool _oom = false;                             // a header or parameter could not be stored; the request is failed
+  bool _closePending = false;                    // close the connection from the next poll or ack callback, never from inside a parser or handler
   std::shared_ptr<AsyncWebServerRequest> _this;  // shared pointer to this request
 
   String _temp;
